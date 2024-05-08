@@ -7,8 +7,8 @@ import math
 import torch.nn.functional as F
 import torch.nn.init as init
 
-universal_dropout = 0.15
-universal_drop_connect = 0.15
+universal_dropout = 0.10
+universal_drop_connect = 0.20
 
 class DPC_RNN(nn.Module):
     def __init__(self, feature_size, hidden_size, kernel_size, num_layers, pred_steps, seq_len):
@@ -39,10 +39,10 @@ class DPC_RNN(nn.Module):
         self._initialize_weights(self.network_pred)
 
     def forward(self, block, B, N, C, SL, H, W):
-        finalW = 136
-        finalH = 40
+        finalW = 64
+        finalH = 32
 
-        feature = F.avg_pool3d(block, ((8, 1, 1)), stride=(1, 1, 1))
+        feature = F.avg_pool3d(block, ((SL, 1, 1)), stride=(1, 1, 1))
         feature_inf_all = feature.view(B, N, C, finalW, finalH)
 
         feature = self.relu(feature)
@@ -54,6 +54,7 @@ class DPC_RNN(nn.Module):
         _, hidden = self.agg(feature[:, 0:N-self.pred_steps, :])
 
         hidden = hidden[:, -1, :]
+        future_context = F.avg_pool3d(hidden, (1, finalW, finalH), stride=1).squeeze(-1).squeeze(-1)
 
         pred = []
         for i in range(self.pred_steps):
@@ -85,10 +86,7 @@ class DPC_RNN(nn.Module):
 
             mask = tmp.view(B, finalH * finalW, self.pred_steps, B, finalH * finalW, N).permute(0,2,1,3,5,4)
 
-        #mask = torch.randint(low=0, high=1, size=score.shape, device=score.device)
-        #print(mask)
-
-        return score, mask
+        return score, mask, future_context
 
     def _initialize_weights(self, module):
         for name, param in module.named_parameters():
@@ -97,92 +95,50 @@ class DPC_RNN(nn.Module):
             elif 'weight' in name:
                 nn.init.orthogonal_(param, 1)
 
-
 class DualStream(nn.Module):
     def __init__(self):
         super(DualStream, self).__init__()
-        self.conv1_layer = nn.Conv3d(in_channels=3, out_channels=256, kernel_size=(5, 7, 7), padding=(2, 3, 3), stride=(1, 2, 2))
-        self.conv1_pool = nn.AvgPool3d(kernel_size=(1, 3, 3), padding=(0, 1, 1), stride=(1, 2, 2))
-        self.norm = nn.BatchNorm3d(256)
-        self.relu = nn.LeakyReLU(negative_slope=0.01)
+        self.left_stream1_block1 = nn.Conv3d(in_channels=3, out_channels=64, kernel_size=(5, 7, 7), padding=(2, 3, 3), stride=(1, 2, 2))
+        self.left_stream1_pool = nn.AvgPool3d(kernel_size=(1, 3, 3), padding=(0, 1, 1), stride=(1, 2, 2))
+        self.left_norm = nn.BatchNorm3d(128)
+        self.left_relu = nn.LeakyReLU(negative_slope=0.01)
 
-        self.stream1_block1 = ResBlock(dim_in=256, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        self.stream1_block2 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        self.stream1_block3 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        self.stream1_block4 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        #self.stream1_block5 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        #self.stream1_block6 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        #self.stream1_block7 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect).to('cuda:0')
-        #self.stream1_block8 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect).to('cuda:0')
-        #self.stream1_block9 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect).to('cuda:0')
-        #self.stream1_block10 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect).to('cuda:0')
+        self.right_stream1_block1 = nn.Conv3d(in_channels=3, out_channels=64, kernel_size=(5, 7, 7), padding=(2, 3, 3), stride=(1, 2, 2))
+        self.right_stream1_pool = nn.AvgPool3d(kernel_size=(1, 3, 3), padding=(0, 1, 1), stride=(1, 2, 2))
+        self.right_norm = nn.BatchNorm3d(128)
+        self.right_relu = nn.LeakyReLU(negative_slope=0.01)
 
-        self.stream2_block1 = ResBlock(dim_in=256, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        self.stream2_block2 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        self.stream2_block3 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        self.stream2_block4 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        #self.stream2_block5 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        #self.stream2_block6 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect)
-        #self.stream2_block7 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect).to('cuda:1')
-        #self.stream2_block8 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect).to('cuda:1')
-        #self.stream2_block9 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect).to('cuda:1')
-        #self.stream2_block10 = ResBlock(dim_in=128, dim_out=128, temp_kernel_size=3, stride=1, dim_inner=32, drop_connect_rate=universal_drop_connect).to('cuda:1')
+        num_blocks = 18
+        for i in range(2, num_blocks + 1):
+            setattr(self, f'left_stream1_block{i}', ResBlock(dim_in=64, dim_out=64, temp_kernel_size=3, stride=1, dim_inner=16, drop_connect_rate=universal_drop_connect))
+            setattr(self, f'right_stream1_block{i}', ResBlock(dim_in=64, dim_out=64, temp_kernel_size=3, stride=1, dim_inner=16, drop_connect_rate=universal_drop_connect))
 
-        
-        """init.kaiming_normal_(self.conv1_layer.weight, mode='fan_out', nonlinearity='relu')
-        
-        # Initialize stream1 blocks with Kaiming initialization
-        for block in [self.stream1_block1, self.stream1_block2]:
-            for name, param in block.named_parameters():
-                if 'weight' in name and param.dim() > 1:
-                    init.kaiming_uniform_(param, a=math.sqrt(5))
+        self.concat_hook_layer = nn.Identity()
 
-        # Initialize stream2 blocks with Kaiming initialization
-        for block in [self.stream2_block1, self.stream2_block2]:
-            for name, param in block.named_parameters():
-                if 'weight' in name and param.dim() > 1:
-                    init.kaiming_uniform_(param, a=math.sqrt(5))"""
-
-        self.dpc_rnn = DPC_RNN(feature_size=256, hidden_size=256, kernel_size=1, num_layers=1, pred_steps=3, seq_len=8).to('cuda:1')
+        self.dpc_rnn = DPC_RNN(feature_size=128, hidden_size=128, kernel_size=1, num_layers=1, pred_steps=3, seq_len=5)
 
     def forward(self, x):
+        num_blocks = 18
         B, N, SL, C, H, W = x.shape
         x = x.view(B*N, C, SL, H, W)
 
-        shared_layer = self.conv1_layer(x)
+        left_input = x[:, :, :, :, :W//2]
+        right_input = x[:, :, :, :, W//2:]
+        
+        left_output = self.left_stream1_block1(left_input)
+        left_output = self.left_stream1_pool(left_output)
+        left_output = self.left_relu(left_output)
 
-        shared_layer_pool = self.conv1_pool(shared_layer)
-        shared_layer_norm = self.norm(shared_layer_pool)
-        shared_layer_relu = self.relu(shared_layer_norm)
+        right_output = self.right_stream1_block1(right_input)
+        right_output = self.right_stream1_pool(right_output)
+        right_output = self.right_relu(right_output)
 
-        stream1layer1 = self.stream1_block1(shared_layer_relu)
-        stream1layer2 = self.stream1_block2(stream1layer1)
-        stream1layer3 = self.stream1_block3(stream1layer2)
-        stream1layer4 = self.stream1_block4(stream1layer3)
-        #stream1layer5 = self.stream1_block5(stream1layer4)
-        #stream1layer6 = self.stream1_block6(stream1layer5)
-        #stream1layer7 = self.stream1_block7(stream1layer6)
-        #stream1layer8 = self.stream1_block8(stream1layer7)
-        #stream1layer9 = self.stream1_block9(stream1layer8)
-        #stream1layer10 = self.stream1_block10(stream1layer9)
-
-        stream2layer1 = self.stream2_block1(shared_layer_relu)
-        stream2layer2 = self.stream2_block2(stream2layer1)
-        stream2layer3 = self.stream2_block3(stream2layer2)
-        stream2layer4 = self.stream2_block4(stream2layer3)
-        #stream2layer5 = self.stream2_block5(stream2layer4)
-        #stream2layer6 = self.stream2_block6(stream2layer5)
-        #stream2layer7 = self.stream2_block7(stream2layer6)
-        #stream2layer8 = self.stream2_block8(stream2layer7)
-        #stream2layer9 = self.stream2_block9(stream2layer8)
-        #stream2layer10 = self.stream2_block10(stream2layer9)
-
-        concat_layer = torch.cat((stream1layer4, stream2layer4), dim=1)
+        for i in range(2, num_blocks + 1):
+            left_output = getattr(self, f'left_stream1_block{i}')(left_output)
+            right_output = getattr(self, f'right_stream1_block{i}')(right_output)
+    
+        concat_layer = torch.cat((left_output, right_output), dim=1)
 
         concat_layer = nn.Dropout(universal_dropout)(concat_layer)
-
-        prediction, target = self.dpc_rnn(concat_layer, B, N, 256, SL, H, W)
-
-        return prediction, target
-    
-    
+        prediction, target, future_context = self.dpc_rnn(concat_layer, B, N, 128, SL, H, W)
+        return prediction, target, concat_layer, future_context
