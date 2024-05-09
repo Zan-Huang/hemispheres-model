@@ -39,10 +39,11 @@ class DPC_RNN(nn.Module):
         self._initialize_weights(self.network_pred)
 
     def forward(self, block, B, N, C, SL, H, W):
-        finalW = 64
-        finalH = 32
+        finalW = W
+        finalH = H
 
-        feature = F.avg_pool3d(block, ((SL, 1, 1)), stride=(1, 1, 1))
+        feature = F.avg_pool3d(block, ((self.seq_len, 1, 1)), stride=(1, 1, 1))
+        del block
         feature_inf_all = feature.view(B, N, C, finalW, finalH)
 
         feature = self.relu(feature)
@@ -53,11 +54,12 @@ class DPC_RNN(nn.Module):
 
         _, hidden = self.agg(feature[:, 0:N-self.pred_steps, :])
 
+
         hidden = hidden[:, -1, :]
         future_context = F.avg_pool3d(hidden, (1, finalW, finalH), stride=1).squeeze(-1).squeeze(-1)
 
         pred = []
-        for i in range(self.pred_steps):
+        for i in range(self.pred_steps): 
             p_tmp = self.network_pred(hidden)
             pred.append(p_tmp)
 
@@ -95,50 +97,77 @@ class DPC_RNN(nn.Module):
             elif 'weight' in name:
                 nn.init.orthogonal_(param, 1)
 
+
+class HemisphereStream(nn.Module):
+    def __init__(self, num_blocks=9, slow_temporal_stride=16, fast_temporal_stride=2):
+        super(HemisphereStream, self).__init__()
+        self.initial_slow_conv = nn.Conv3d(3, 64, kernel_size=(1, 1, 1), stride=1, padding=0)
+        self.initial_fast_conv = nn.Conv3d(3, 8, kernel_size=(1, 1, 1), stride=1, padding=0)
+
+        self.slow_temporal_stride = slow_temporal_stride
+        self.fast_temporal_stride = fast_temporal_stride
+        
+        slow_channels = [64 if i == 0 else 128 for i in range(num_blocks)]
+        fast_channels = [8 if i == 0 else 16 for i in range(num_blocks)]
+
+        # Slow pathway
+        self.slow_blocks = nn.ModuleList([
+            ResBlock(dim_in=slow_channels[i], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16) for i in range(num_blocks)
+        ])
+        # Fast pathway
+        self.fast_blocks = nn.ModuleList([
+            ResBlock(dim_in=fast_channels[i], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8) for i in range(num_blocks)  # Smaller inner dimension
+        ])
+
+
+    def forward(self, x):
+        # Apply temporal stride correctly
+        slow_input = self.initial_slow_conv(x[:, :, ::self.slow_temporal_stride, :, :])
+        fast_input = self.initial_fast_conv(x[:, :, ::self.fast_temporal_stride, :, :])
+
+        slow_output = slow_input
+        fast_output = fast_input
+
+        for slow_block, fast_block in zip(self.slow_blocks, self.fast_blocks):
+            slow_output = slow_block(slow_output)
+            fast_output = fast_block(fast_output)
+
+
+        max_temporal_depth = max(slow_output.size(2), fast_output.size(2))
+        max_height = max(slow_output.size(3), fast_output.size(3))
+        max_width = max(slow_output.size(4), fast_output.size(4))
+
+        slow_output = F.pad(slow_output, (0, max_width - slow_output.size(4), 0, max_height - slow_output.size(3), 0, max_temporal_depth - slow_output.size(2)))
+        fast_output = F.pad(fast_output, (0, max_width - fast_output.size(4), 0, max_height - fast_output.size(3), 0, max_temporal_depth - fast_output.size(2)))
+        
+        # Fusion of slow and fast pathways
+        output = torch.cat((slow_output, fast_output), dim=1)
+
+        return output
+
+
+
 class DualStream(nn.Module):
     def __init__(self):
         super(DualStream, self).__init__()
-        self.left_stream1_block1 = nn.Conv3d(in_channels=3, out_channels=64, kernel_size=(5, 7, 7), padding=(2, 3, 3), stride=(1, 2, 2))
-        self.left_stream1_pool = nn.AvgPool3d(kernel_size=(1, 3, 3), padding=(0, 1, 1), stride=(1, 2, 2))
-        self.left_norm = nn.BatchNorm3d(128)
-        self.left_relu = nn.LeakyReLU(negative_slope=0.01)
-
-        self.right_stream1_block1 = nn.Conv3d(in_channels=3, out_channels=64, kernel_size=(5, 7, 7), padding=(2, 3, 3), stride=(1, 2, 2))
-        self.right_stream1_pool = nn.AvgPool3d(kernel_size=(1, 3, 3), padding=(0, 1, 1), stride=(1, 2, 2))
-        self.right_norm = nn.BatchNorm3d(128)
-        self.right_relu = nn.LeakyReLU(negative_slope=0.01)
-
-        num_blocks = 18
-        for i in range(2, num_blocks + 1):
-            setattr(self, f'left_stream1_block{i}', ResBlock(dim_in=64, dim_out=64, temp_kernel_size=3, stride=1, dim_inner=16, drop_connect_rate=universal_drop_connect))
-            setattr(self, f'right_stream1_block{i}', ResBlock(dim_in=64, dim_out=64, temp_kernel_size=3, stride=1, dim_inner=16, drop_connect_rate=universal_drop_connect))
-
-        self.concat_hook_layer = nn.Identity()
-
-        self.dpc_rnn = DPC_RNN(feature_size=128, hidden_size=128, kernel_size=1, num_layers=1, pred_steps=3, seq_len=5)
+        self.left_hemisphere = HemisphereStream()
+        self.right_hemisphere = HemisphereStream()
+        self.dpc_rnn = DPC_RNN(feature_size=288, hidden_size=288, kernel_size=1, num_layers=1, pred_steps=3, seq_len=3) # normally 5 for SL
+        # feature size is 144 * 2
 
     def forward(self, x):
-        num_blocks = 18
         B, N, SL, C, H, W = x.shape
         x = x.view(B*N, C, SL, H, W)
 
         left_input = x[:, :, :, :, :W//2]
         right_input = x[:, :, :, :, W//2:]
-        
-        left_output = self.left_stream1_block1(left_input)
-        left_output = self.left_stream1_pool(left_output)
-        left_output = self.left_relu(left_output)
 
-        right_output = self.right_stream1_block1(right_input)
-        right_output = self.right_stream1_pool(right_output)
-        right_output = self.right_relu(right_output)
+        left_output = self.left_hemisphere(left_input)
+        right_output = self.right_hemisphere(right_input)
 
-        for i in range(2, num_blocks + 1):
-            left_output = getattr(self, f'left_stream1_block{i}')(left_output)
-            right_output = getattr(self, f'right_stream1_block{i}')(right_output)
-    
+        # Concatenate left and right hemisphere outputs
         concat_layer = torch.cat((left_output, right_output), dim=1)
 
-        concat_layer = nn.Dropout(universal_dropout)(concat_layer)
-        prediction, target, future_context = self.dpc_rnn(concat_layer, B, N, 128, SL, H, W)
+        # Dropout can be added here if needed
+        prediction, target, future_context = self.dpc_rnn(concat_layer, B, N, 288, SL, H, W//2)
         return prediction, target, concat_layer, future_context
