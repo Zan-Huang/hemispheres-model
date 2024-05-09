@@ -11,7 +11,8 @@ from torchvision.utils import make_grid
 from torchvision.transforms.functional import to_pil_image
 from PIL import Image
 import torchvision.transforms.functional as TF
-
+import av
+import h5py
 
 def save_checkpoint(model, path):
     """
@@ -69,51 +70,53 @@ def calc_topk_accuracy(output, target, topk=(1,)):
     return res
 
 class TheDataset(Dataset):
-    def __init__(self, root_dir, transform=None, use_percentage=1.0):
-        self.root_dir = root_dir
+    def __init__(self, hdf5_file, transform=None, seq_len=30, num_seq=8):
+        """
+        Args:
+        hdf5_file (str): Path to the HDF5 file containing the video frames.
+        transform (callable, optional): Optional transform to be applied on a sample.
+        seq_len (int): Number of frames in each sequence.
+        num_seq (int): Number of sequences to sample from each video.
+        """
+        self.hdf5_file = hdf5_file
         self.transform = transform
-        self.video_files = [os.path.join(root_dir, f) for f in os.listdir(root_dir) if f.endswith('.mp4')]
-        random.shuffle(self.video_files)
-        num_files_to_use = int(len(self.video_files) * use_percentage)
-        self.video_files = self.video_files[:num_files_to_use]
+        self.seq_len = seq_len
+        self.num_seq = num_seq
+        
+        # Open the HDF5 file and list all video groups
+        self.h5_file = h5py.File(self.hdf5_file, 'r')
+        self.video_keys = list(self.h5_file.keys())
 
     def __len__(self):
-        return len(self.video_files)
+        return len(self.video_keys)
     
     def __getitem__(self, idx):
-        video_path = self.video_files[idx]
-        video_frames = read_video_frames(video_path, self.transform, seq_len=30, num_seq=8)
-        return {'video': video_frames}
+        video_key = self.video_keys[idx]
+        video_group = self.h5_file[video_key]
+        
+        total_frames = len(video_group)
+        frames = []
+        
+        # Calculate the spacing between the starts of each sequence
+        spacing = total_frames // self.num_seq
+        
+        frame_indices = []
+        for seq_index in range(self.num_seq):
+            start_frame = seq_index * spacing
+            for frame_index in range(self.seq_len):
+                frame_indices.append(start_frame + frame_index)
+        
+        # Collect frames based on calculated indices
+        for frame_index in frame_indices:
+            frame_data = video_group[f'frame_{frame_index}'][()]
+            if self.transform:
+                frame_data = self.transform(frame_data)
+            frames.append(frame_data)
+        
+        return torch.stack(frames, dim=0).view(self.num_seq, self.seq_len, *frames[0].shape)
 
-def read_video_frames(video_path, transform, seq_len=30, num_seq=8):
-    cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    frames = []
-    frame_indices = []
-
-    # Calculate the spacing between the starts of each sequence
-    spacing = total_frames // num_seq
-
-    for seq_index in range(num_seq):
-        start_frame = seq_index * spacing
-        for frame_index in range(seq_len):
-            frame_indices.append(start_frame + frame_index)
-
-    for frame_index in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        ret, frame = cap.read()
-        if not ret:
-            cap.release()
-            return None
-
-        frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        if transform:
-            frame = transform(frame)
-        frames.append(frame)
-
-    cap.release()
-    return torch.stack(frames, dim=0).view(num_seq, seq_len, *frames[0].size())
+    def close(self):
+        self.h5_file.close()
 
 # Configuration
 config = {
@@ -129,12 +132,14 @@ config = {
 
 def setup_transforms():
     return transforms.Compose([
+        transforms.ToPILImage(),
         transforms.Resize((240, 180)),
         transforms.ToTensor(),
     ])
 
 def setup_data_loaders(data_dir, transform):
-    full_dataset = TheDataset(root_dir=data_dir, transform=transform)
+    full_dataset = TheDataset('video_frames.h5', transform=transform)
+    print(full_dataset[0].shape)
 
     train_size = int(0.85 * len(full_dataset))
     val_size = len(full_dataset) - train_size
