@@ -99,7 +99,7 @@ class DPC_RNN(nn.Module):
 
 
 class HemisphereStream(nn.Module):
-    def __init__(self, num_blocks=9, slow_temporal_stride=16, fast_temporal_stride=2):
+    def __init__(self, num_blocks=9, slow_temporal_stride=15, fast_temporal_stride=2):
         super(HemisphereStream, self).__init__()
         self.initial_slow_conv = nn.Conv3d(3, 64, kernel_size=(1, 1, 1), stride=1, padding=0)
         self.initial_fast_conv = nn.Conv3d(3, 8, kernel_size=(1, 1, 1), stride=1, padding=0)
