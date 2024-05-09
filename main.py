@@ -23,7 +23,7 @@ def save_checkpoint(model, path):
     """
     torch.save(model.state_dict(), path)
 
-def log_sampled_frames(frames, num_seq=8, seq_len=5, downsample=3, resize_shape=(256, 256)):
+def log_sampled_frames(frames, num_seq=8, seq_len=5, downsample=3, resize_shape=(128, 128)):
     """
     Log a grid of sampled frames from a video sequence.
 
@@ -68,80 +68,37 @@ def calc_topk_accuracy(output, target, topk=(1,)):
         res.append(correct_k.mul_(1 / batch_size))
     return res
 
-
-
 class TheDataset(Dataset):
-    def __init__(self, root_dir, split='training', transform=None, use_percentage=1.0, seq_len=5, num_seq=8, downsample=3):
-        #self.root_dir = os.path.join(root_dir, split) #we are using non split
+    def __init__(self, root_dir, transform=None, use_percentage=1.0):
         self.root_dir = root_dir
         self.transform = transform
-        self.seq_len = seq_len
-        self.num_seq = num_seq
-        self.downsample = downsample
-        self.video_files = []
-        self.labels = [] 
-        
-        # Adjust for Moments in Time directory structure
-        for action_category in os.listdir(self.root_dir):
-            print(action_category)
-            category_path = os.path.join(self.root_dir, action_category)
-            if os.path.isdir(category_path):
-                for video_file in os.listdir(category_path):
-                    video_path = os.path.join(category_path, video_file)
-                    # Adjust the file extension as needed for your dataset
-                    if video_file.endswith('.avi'):
-                        self.video_files.append(video_path)
-                        self.labels.append(action_category)
-
-        combined = list(zip(self.video_files, self.labels))
-        random.shuffle(combined)
-        self.video_files, self.labels = zip(*combined)
-
+        self.video_files = [os.path.join(root_dir, f) for f in os.listdir(root_dir) if f.endswith('.mp4')]
+        random.shuffle(self.video_files)
         num_files_to_use = int(len(self.video_files) * use_percentage)
         self.video_files = self.video_files[:num_files_to_use]
-        self.labels = self.labels[:num_files_to_use]
 
     def __len__(self):
-        print(len(self.video_files))
         return len(self.video_files)
     
     def __getitem__(self, idx):
         video_path = self.video_files[idx]
-        label = self.labels[idx]  # Get the label for the current index
+        video_frames = read_video_frames(video_path, self.transform, seq_len=30, num_seq=8)
+        return {'video': video_frames}
 
-        video_frames = read_video_frames(video_path, self.transform, self.seq_len, self.num_seq, self.downsample)
-    
-        attempts = 0
-        while video_frames is None and attempts < len(self.video_files):
-            idx = (idx + 1) % len(self.video_files)  # Move to the next index
-            video_path = self.video_files[idx]
-            label = self.labels[idx]  # Update the label accordingly
-            video_frames = read_video_frames(video_path, self.transform, self.seq_len, self.num_seq, self.downsample)
-            attempts += 1
-
-        if video_frames is None:
-            raise RuntimeError("Failed to find a video with enough frames after multiple attempts.")
-
-        return {'video': video_frames, 'label': label}
-
-def read_video_frames(video_path, transform, seq_len=5, num_seq=8, downsample=3):
+def read_video_frames(video_path, transform, seq_len=30, num_seq=8):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
     frames = []
     frame_indices = []
 
-    if total_frames > 0:
-        spacing = max(1, (total_frames - downsample * (seq_len - 1)) // num_seq)
+    # Calculate the spacing between the starts of each sequence
+    spacing = total_frames // num_seq
 
     for seq_index in range(num_seq):
         start_frame = seq_index * spacing
         for frame_index in range(seq_len):
-            if start_frame + frame_index * downsample < total_frames:
-                frame_indices.append(start_frame + frame_index * downsample)
-            else:
-                # Not enough frames
-                cap.release()
-                return None  # Indicate insufficient frames
+            frame_indices.append(start_frame + frame_index)
 
     for frame_index in frame_indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
@@ -150,8 +107,7 @@ def read_video_frames(video_path, transform, seq_len=5, num_seq=8, downsample=3)
             cap.release()
             return None
 
-        #frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frame = Image.fromarray(frame)
+        frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         if transform:
             frame = transform(frame)
         frames.append(frame)
@@ -161,7 +117,7 @@ def read_video_frames(video_path, transform, seq_len=5, num_seq=8, downsample=3)
 
 # Configuration
 config = {
-    "data_dir": '/home/zanh/ventral-dorsal-replication/UCF-101/UCF-101',
+    "data_dir": 'splice',
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     "batch_size": 2,
     "learning_rate": 0.001,
@@ -173,17 +129,28 @@ config = {
 
 def setup_transforms():
     return transforms.Compose([
-        transforms.Resize((128, 128)),
+        transforms.Resize((240, 180)),
         transforms.ToTensor(),
     ])
 
 def setup_data_loaders(data_dir, transform):
-    train_dataset = TheDataset(root_dir=data_dir, split='training', transform=transform)
-    val_dataset = TheDataset(root_dir=data_dir, split='validation', transform=transform)
+    full_dataset = TheDataset(root_dir=data_dir, transform=transform)
 
-    train_size = int(0.85 * len(train_dataset))
-    val_size = len(train_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+    train_size = int(0.85 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+
+    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+
+    train_filenames = [full_dataset.video_files[idx] for idx in train_dataset.indices]
+    val_filenames = [full_dataset.video_files[idx] for idx in val_dataset.indices]
+
+    with open('train_files.txt', 'w') as f:
+        for filename in train_filenames:
+            f.write(f"{filename}\n")
+
+    with open('val_files.txt', 'w') as f:
+        for filename in val_filenames:
+            f.write(f"{filename}\n")
 
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'], pin_memory=config['pin_memory'], drop_last=config['drop_last'])
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=config['num_workers'], pin_memory=config['pin_memory'], drop_last=config['drop_last'])
