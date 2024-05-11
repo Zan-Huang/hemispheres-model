@@ -11,8 +11,8 @@ from torchvision.utils import make_grid
 from torchvision.transforms.functional import to_pil_image
 from PIL import Image
 import torchvision.transforms.functional as TF
+from torchvision.transforms.functional import to_tensor
 import av
-import h5py
 
 def save_checkpoint(model, path):
     """
@@ -24,7 +24,7 @@ def save_checkpoint(model, path):
     """
     torch.save(model.state_dict(), path)
 
-def log_sampled_frames(frames, num_seq=8, seq_len=5, downsample=3, resize_shape=(128, 128)):
+def log_sampled_frames(frames, num_seq=8, seq_len=30, downsample=1, resize_shape=(240, 180)):
     """
     Log a grid of sampled frames from a video sequence.
 
@@ -70,59 +70,59 @@ def calc_topk_accuracy(output, target, topk=(1,)):
     return res
 
 class TheDataset(Dataset):
-    def __init__(self, hdf5_file, transform=None, seq_len=30, num_seq=8):
-        """
-        Args:
-        hdf5_file (str): Path to the HDF5 file containing the video frames.
-        transform (callable, optional): Optional transform to be applied on a sample.
-        seq_len (int): Number of frames in each sequence.
-        num_seq (int): Number of sequences to sample from each video.
-        """
-        self.hdf5_file = hdf5_file
+    def __init__(self, root_dir, transform=None, use_percentage=1.0):
+        self.root_dir = root_dir
         self.transform = transform
-        self.seq_len = seq_len
-        self.num_seq = num_seq
-        
-        # Open the HDF5 file and list all video groups
-        self.h5_file = h5py.File(self.hdf5_file, 'r')
-        self.video_keys = list(self.h5_file.keys())
+        self.video_files = [os.path.join(root_dir, f) for f in os.listdir(root_dir) if f.endswith('.mp4')]
+        random.shuffle(self.video_files)
+        num_files_to_use = int(len(self.video_files) * use_percentage)
+        self.video_files = self.video_files[:num_files_to_use]
 
     def __len__(self):
-        return len(self.video_keys)
+        return len(self.video_files)
     
     def __getitem__(self, idx):
-        video_key = self.video_keys[idx]
-        video_group = self.h5_file[video_key]
-        
-        total_frames = len(video_group)
-        frames = []
-        
-        # Calculate the spacing between the starts of each sequence
-        spacing = total_frames // self.num_seq
-        
-        frame_indices = []
-        for seq_index in range(self.num_seq):
-            start_frame = seq_index * spacing
-            for frame_index in range(self.seq_len):
-                frame_indices.append(start_frame + frame_index)
-        
-        # Collect frames based on calculated indices
-        for frame_index in frame_indices:
-            frame_data = video_group[f'frame_{frame_index}'][()]
-            if self.transform:
-                frame_data = self.transform(frame_data)
-            frames.append(frame_data)
-        
-        return torch.stack(frames, dim=0).view(self.num_seq, self.seq_len, *frames[0].shape)
+        video_path = self.video_files[idx]
+        video_frames = read_video_frames(video_path, self.transform, seq_len=30, num_seq=8)
+        return {'video': video_frames}
 
-    def close(self):
-        self.h5_file.close()
+def read_video_frames(video_path, transform=None, num_seq = 8, seq_len = 30):
+    num_seq = num_seq
+    seq_len = seq_len
+    total_frames_needed = num_seq * seq_len  # 8 sequences of 30 frames each
+
+    container = av.open(video_path)
+    stream = container.streams.video[0]
+    fps = stream.rate  # Get the frames per second from the video file
+
+    frames = []
+    frame_indices = list(range(0, total_frames_needed))  # We need frames from 0 to 239
+
+    for frame_index in frame_indices:
+        container.seek(frame_index * int(stream.time_base / av.time_base), any_frame=False, backward=True, stream=stream)
+        for frame in container.decode(video=0):
+            if frame.index == frame_index:
+                img = frame.to_image()  # Convert to PIL Image
+                if transform:
+                    img = transform(img)
+                frames.append(img)
+                break
+
+    container.close()
+    # Adjust the way dimensions are accessed based on the type of frames[0]
+    if isinstance(frames[0], torch.Tensor):
+        frame_dims = frames[0].shape[1:]  # Skip the batch dimension if it's a tensor
+    else:
+        frame_dims = frames[0].size  # Use size for PIL Images
+
+    frames_tensor = torch.stack([to_tensor(frame) if not isinstance(frame, torch.Tensor) else frame for frame in frames], dim=0).view(num_seq, seq_len, 3, *frame_dims)
+    return frames_tensor
 
 # Configuration
 config = {
     "data_dir": 'splice',
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "batch_size": 2,
+    "batch_size": 6,
     "learning_rate": 0.001,
     "epochs": 100,
     "num_workers": 16,
@@ -132,14 +132,12 @@ config = {
 
 def setup_transforms():
     return transforms.Compose([
-        transforms.ToPILImage(),
         transforms.Resize((240, 180)),
         transforms.ToTensor(),
     ])
 
 def setup_data_loaders(data_dir, transform):
-    full_dataset = TheDataset('video_frames.h5', transform=transform)
-    print(full_dataset[0].shape)
+    full_dataset = TheDataset(root_dir=data_dir, transform=transform)
 
     train_size = int(0.85 * len(full_dataset))
     val_size = len(full_dataset) - train_size
@@ -180,8 +178,8 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         wandb.log({"train_loss": loss.item(), "learning_rate": optimizer.param_groups[0]['lr']}, step=unique_step_identifier)
         unique_step_identifier += 1
 
-        if i % 100 == 0:
-            log_sampled_frames(inputs[0], num_seq=8, seq_len=5, downsample=3)
+        if i % 1 == 0:
+            log_sampled_frames(inputs[0], num_seq=8, seq_len=30, downsample=1)
             wandb.log({"top15_accuracy": calc_topk_accuracy(score_flattened, target_flattened, topk=(1,5))[0]}, step=unique_step_identifier)
 
         if i % 500 == 0:
