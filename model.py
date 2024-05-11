@@ -39,10 +39,11 @@ class DPC_RNN(nn.Module):
         self._initialize_weights(self.network_pred)
 
     def forward(self, block, B, N, C, SL, H, W):
-        finalW = W
-        finalH = H
+        finalW = 11
+        finalH = 30
 
-        feature = F.avg_pool3d(block, ((self.seq_len, 1, 1)), stride=(1, 1, 1))
+        #feature = F.avg_pool3d(block, ((self.seq_len, 1, 1)), stride=(1, 1, 1))
+        feature = block
         del block
         feature_inf_all = feature.view(B, N, C, finalW, finalH)
 
@@ -99,24 +100,50 @@ class DPC_RNN(nn.Module):
 
 
 class HemisphereStream(nn.Module):
-    def __init__(self, num_blocks=9, slow_temporal_stride=15, fast_temporal_stride=2):
+    def __init__(self, num_blocks=9, slow_temporal_stride=10, fast_temporal_stride=2):
         super(HemisphereStream, self).__init__()
         self.initial_slow_conv = nn.Conv3d(3, 64, kernel_size=(1, 1, 1), stride=1, padding=0)
         self.initial_fast_conv = nn.Conv3d(3, 8, kernel_size=(1, 1, 1), stride=1, padding=0)
 
         self.slow_temporal_stride = slow_temporal_stride
         self.fast_temporal_stride = fast_temporal_stride
+
+        #self.hemisphere_weight = nn.Parameter(torch.randn(128 * 128 * 128))  # Example dimensions from the output of a block
         
         slow_channels = [64 if i == 0 else 128 for i in range(num_blocks)]
         fast_channels = [8 if i == 0 else 16 for i in range(num_blocks)]
 
         # Slow pathway
         self.slow_blocks = nn.ModuleList([
-            ResBlock(dim_in=slow_channels[i], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16) for i in range(num_blocks)
+            #ResBlock(dim_in=slow_channels[i], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16) for i in range(num_blocks)
+            ResBlock(dim_in=slow_channels[0], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
+            ResBlock(dim_in=slow_channels[1], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
+            ResBlock(dim_in=slow_channels[2], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
+            nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2), padding=0),
+            ResBlock(dim_in=slow_channels[3], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
+            ResBlock(dim_in=slow_channels[4], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
+            ResBlock(dim_in=slow_channels[5], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
+            nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(1, 2, 2), padding=0),
+            ResBlock(dim_in=slow_channels[6], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
+            ResBlock(dim_in=slow_channels[7], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
+            ResBlock(dim_in=slow_channels[8], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
+            nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(1, 2, 2), padding=0)
         ])
         # Fast pathway
         self.fast_blocks = nn.ModuleList([
-            ResBlock(dim_in=fast_channels[i], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8) for i in range(num_blocks)  # Smaller inner dimension
+            #ResBlock(dim_in=fast_channels[i], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8) for i in range(num_blocks)  # Smaller inner dimension
+            ResBlock(dim_in=fast_channels[0], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
+            ResBlock(dim_in=fast_channels[1], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
+            ResBlock(dim_in=fast_channels[2], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
+            nn.MaxPool3d(kernel_size=(5, 2, 2), stride=(1, 2, 2), padding=0),
+            ResBlock(dim_in=fast_channels[3], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
+            ResBlock(dim_in=fast_channels[4], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
+            ResBlock(dim_in=fast_channels[5], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
+            nn.MaxPool3d(kernel_size=(6, 2, 2), stride=(1, 2, 2), padding=0),
+            ResBlock(dim_in=fast_channels[6], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
+            ResBlock(dim_in=fast_channels[7], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
+            ResBlock(dim_in=fast_channels[8], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
+            nn.MaxPool3d(kernel_size=(6, 2, 2), stride=(1, 2, 2), padding=0)
         ])
 
 
@@ -131,15 +158,9 @@ class HemisphereStream(nn.Module):
         for slow_block, fast_block in zip(self.slow_blocks, self.fast_blocks):
             slow_output = slow_block(slow_output)
             fast_output = fast_block(fast_output)
-
-
-        max_temporal_depth = max(slow_output.size(2), fast_output.size(2))
-        max_height = max(slow_output.size(3), fast_output.size(3))
-        max_width = max(slow_output.size(4), fast_output.size(4))
-
-        slow_output = F.pad(slow_output, (0, max_width - slow_output.size(4), 0, max_height - slow_output.size(3), 0, max_temporal_depth - slow_output.size(2)))
-        fast_output = F.pad(fast_output, (0, max_width - fast_output.size(4), 0, max_height - fast_output.size(3), 0, max_temporal_depth - fast_output.size(2)))
         
+        #print("slow output shape", slow_output.shape)
+        #print("fast output shape", fast_output.shape)
         # Fusion of slow and fast pathways
         output = torch.cat((slow_output, fast_output), dim=1)
 
