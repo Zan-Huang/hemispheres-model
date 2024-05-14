@@ -11,8 +11,11 @@ from torchvision.utils import make_grid
 from torchvision.transforms.functional import to_pil_image
 from PIL import Image
 import torchvision.transforms.functional as TF
-from torchvision.transforms.functional import to_tensor
+from torchvision.transforms.functional import to_tensor, to_pil_image
+from torchvision.transforms.functional import resize
 import av
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 
 def save_checkpoint(model, path):
     """
@@ -24,21 +27,38 @@ def save_checkpoint(model, path):
     """
     torch.save(model.state_dict(), path)
 
-def log_sampled_frames(frames, num_seq=8, seq_len=30, downsample=1, resize_shape=(240, 180)):
+def log_sampled_frames(frames, num_seq=8, seq_len=30, resize_shape=(90, 120)):
     """
-    Log a grid of sampled frames from a video sequence.
+    Log a grid of sampled frames from a video sequence to Weights & Biases (wandb).
 
     Args:
-    - frames: A tensor of video frames of shape (num_seq, seq_len, C, H, W).
-    - num_seq: Number of sequences sampled from the video.
-    - seq_len: Number of frames in each sequence.
-    - downsample: Factor by which frames were downsampled.
-    - resize_shape: Resize shape for each frame, for consistent grid display.
+    - frames (torch.Tensor): A tensor of video frames of shape (num_seq, seq_len, C, H, W).
+    - num_seq (int): Number of sequences sampled from the video.
+    - seq_len (int): Number of frames in each sequence.
+    - resize_shape (tuple): Resize shape for each frame, for consistent grid display.
+
+    Raises:
+    - ValueError: If the input tensor does not match the expected shape.
     """
-    selected_frames = frames[:, 0]  # Select the first frame from each sequence for simplicity
-    selected_frames_resized = torch.stack([TF.resize(frame, resize_shape) for frame in selected_frames])
+    # Validate input tensor shape
+    if not isinstance(frames, torch.Tensor) or len(frames.shape) != 5:
+        raise ValueError("Frames must be a 5D tensor of shape (num_seq, seq_len, C, H, W).")
+    if frames.shape[0] < num_seq or frames.shape[1] < seq_len:
+        raise ValueError("Frames tensor does not have enough sequences or frames per sequence.")
+
+    # Select the first frame from each sequence for simplicity
+    selected_frames = frames[:, 0]  # This selects the first frame in each sequence
+
+    # Resize frames for consistent display
+    selected_frames_resized = torch.stack([resize(frame, resize_shape) for frame in selected_frames])
+
+    # Create a grid of images
     frame_grid = make_grid(selected_frames_resized, nrow=num_seq, normalize=True)
+
+    # Convert the tensor grid to a PIL image
     grid_image = to_pil_image(frame_grid)
+
+    # Log the grid image to wandb
     wandb.log({"sampled_frames": [wandb.Image(grid_image, caption="Sampled Frames")]})
 
 def process_output(mask):
@@ -86,53 +106,47 @@ class TheDataset(Dataset):
         video_frames = read_video_frames(video_path, self.transform, seq_len=30, num_seq=8)
         return {'video': video_frames}
 
-def read_video_frames(video_path, transform=None, num_seq = 8, seq_len = 30):
-    num_seq = num_seq
-    seq_len = seq_len
-    total_frames_needed = num_seq * seq_len  # 8 sequences of 30 frames each
-
+def read_video_frames(video_path, transform=None, num_seq=8, seq_len=30):
     container = av.open(video_path)
     stream = container.streams.video[0]
-    fps = stream.rate  # Get the frames per second from the video file
 
     frames = []
-    frame_indices = list(range(0, total_frames_needed))  # We need frames from 0 to 239
+    frame_indices = list(range(0, num_seq * seq_len))
 
-    for frame_index in frame_indices:
-        container.seek(frame_index * int(stream.time_base / av.time_base), any_frame=False, backward=True, stream=stream)
-        for frame in container.decode(video=0):
-            if frame.index == frame_index:
-                img = frame.to_image()  # Convert to PIL Image
-                if transform:
-                    img = transform(img)
-                frames.append(img)
-                break
+    for frame in container.decode(video=0):
+        img = frame.to_image()  # Convert to PIL Image
+        if transform:
+            img = transform(img)
+        frames.append(img)
 
     container.close()
-    # Adjust the way dimensions are accessed based on the type of frames[0]
-    if isinstance(frames[0], torch.Tensor):
-        frame_dims = frames[0].shape[1:]  # Skip the batch dimension if it's a tensor
-    else:
-        frame_dims = frames[0].size  # Use size for PIL Images
 
-    frames_tensor = torch.stack([to_tensor(frame) if not isinstance(frame, torch.Tensor) else frame for frame in frames], dim=0).view(num_seq, seq_len, 3, *frame_dims)
+    # Check if frames are already tensors, if not convert them
+    if not isinstance(frames[0], torch.Tensor):
+        frames = [to_tensor(frame) for frame in frames]
+
+    # Ensure we have the correct number of frames
+    if len(frames) != num_seq * seq_len:
+        raise ValueError(f"Expected {num_seq * seq_len} frames, but got {len(frames)}")
+
+    frames_tensor = torch.stack(frames, dim=0).view(num_seq, seq_len, 3, *frames[0].shape[1:])
+
     return frames_tensor
-
 # Configuration
 config = {
     "data_dir": 'splice',
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    "batch_size": 6,
+    "batch_size": 12,
     "learning_rate": 0.001,
     "epochs": 100,
-    "num_workers": 16,
+    "num_workers": 5,
     "pin_memory": True,
     "drop_last": True
 }
 
 def setup_transforms():
     return transforms.Compose([
-        transforms.Resize((240, 180)),
+        transforms.Resize((90, 120)),
         transforms.ToTensor(),
     ])
 
@@ -163,31 +177,38 @@ def setup_data_loaders(data_dir, transform):
 def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
     model.train()
     total_loss = 0
+    total_hemisphere_loss = 0
     unique_step_identifier = 0
     for i, batch in enumerate(train_loader):
         inputs = batch['video'].to(device)
-        score, mask, embedding, future_context = model(inputs)
+        score, mask, embedding, future_context, cosine_score = model(inputs)
         target, (_, B2, NS, NP, SQ) = process_output(mask)
         score_flattened = score.reshape(-1, B2*NS*SQ)
         target_flattened = target.reshape(-1, B2*NS*SQ).int().argmax(dim=1)
-        loss = criterion(score_flattened, target_flattened)
+        loss = criterion(score_flattened, target_flattened) + cosine_score.mean()
+        
+        print(f"Step {unique_step_identifier}: total loss: {loss.item()}")
+        print(f"Step {unique_step_identifier}: hemisphere loss: {cosine_score.mean().item()}")
+        
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item()
-        wandb.log({"train_loss": loss.item(), "learning_rate": optimizer.param_groups[0]['lr']}, step=unique_step_identifier)
+        total_hemisphere_loss += cosine_score.mean().item()
+        wandb.log({"train_loss": loss.item(), "hemisphere_loss": cosine_score.mean().item(), "learning_rate": optimizer.param_groups[0]['lr']}, step=unique_step_identifier)
         unique_step_identifier += 1
 
-        if i % 1 == 0:
-            log_sampled_frames(inputs[0], num_seq=8, seq_len=30, downsample=1)
+        if i % 25 == 0:
+            log_sampled_frames(inputs[0], num_seq=8, seq_len=30)
             wandb.log({"top15_accuracy": calc_topk_accuracy(score_flattened, target_flattened, topk=(1,5))[0]}, step=unique_step_identifier)
 
-        if i % 500 == 0:
+        if i % 250 == 0:
             for name, param in model.named_parameters():
                 if param.requires_grad:
                     wandb.log({f"gradients/{name}": wandb.Histogram(param.grad.cpu().numpy())}, step=unique_step_identifier)
 
-    return total_loss / len(train_loader)
+    return total_loss / len(train_loader), total_hemisphere_loss / len(train_loader)
 
 def validate(model, val_loader, criterion, device):
     model.eval()
@@ -202,7 +223,7 @@ def validate(model, val_loader, criterion, device):
             target_flattened = target.reshape(-1, B2*NS*SQ).int().argmax(dim=1)
             loss = criterion(score_flattened, target_flattened)
             total_loss += loss.item()
-            total_top_k_accuracy += calc_topk_accuracy(score_flattened, target_flattened, topk=(1,3))[0]
+            total_top_k_accuracy += calc_topk_accuracy(score_flattened, target_flattened, topk=(1,5))[0]
     average_val_loss = total_loss / len(val_loader)
     average_val_top_k_accuracy = total_top_k_accuracy / len(val_loader)
     wandb.log({"val_loss": average_val_loss, "val_top_k_accuracy": average_val_top_k_accuracy})
@@ -222,14 +243,22 @@ def main():
     
     criterion = nn.CrossEntropyLoss().to(config['device'])
     optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, verbose=True)
 
     for epoch in range(config['epochs']):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, config['device'], epoch)
+        train_loss, train_hemisphere_loss = train_epoch(model, train_loader, criterion, optimizer, config['device'], epoch)
         val_loss, val_top_k_accuracy = validate(model, val_loader, criterion, config['device'])
-        wandb.log({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_top_k_accuracy": val_top_k_accuracy})
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_hemisphere_loss": train_hemisphere_loss,
+            "val_loss": val_loss,
+            "val_top_k_accuracy": val_top_k_accuracy,
+            "learning_rate": optimizer.param_groups[0]['lr']
+        })
 
         # Save model checkpoint
-        if (epoch + 1) % 1 == 0:  # Adjust as per your checkpoint saving frequency
+        if (epoch + 1) % 1 == 0:
             checkpoint_path = os.path.join("models", f'model_epoch_{epoch+1}.pth')
             save_checkpoint(model.module if isinstance(model, nn.DataParallel) else model, checkpoint_path)
             print(f"Saved model checkpoint at {checkpoint_path}")
