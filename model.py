@@ -40,7 +40,7 @@ class DPC_RNN(nn.Module):
 
     def forward(self, block, B, N, C, SL, H, W):
         finalW = 11
-        finalH = 30
+        finalH = 7
 
         #feature = F.avg_pool3d(block, ((self.seq_len, 1, 1)), stride=(1, 1, 1))
         feature = block
@@ -102,16 +102,16 @@ class DPC_RNN(nn.Module):
 class HemisphereStream(nn.Module):
     def __init__(self, num_blocks=9, slow_temporal_stride=10, fast_temporal_stride=2):
         super(HemisphereStream, self).__init__()
-        self.initial_slow_conv = nn.Conv3d(3, 64, kernel_size=(1, 1, 1), stride=1, padding=0)
-        self.initial_fast_conv = nn.Conv3d(3, 8, kernel_size=(1, 1, 1), stride=1, padding=0)
+        self.initial_slow_conv = nn.Conv3d(3, 128, kernel_size=(1, 1, 1), stride=1, padding=0)
+        self.initial_fast_conv = nn.Conv3d(3, 16, kernel_size=(1, 1, 1), stride=1, padding=0)
 
         self.slow_temporal_stride = slow_temporal_stride
         self.fast_temporal_stride = fast_temporal_stride
 
         #self.hemisphere_weight = nn.Parameter(torch.randn(128 * 128 * 128))  # Example dimensions from the output of a block
         
-        slow_channels = [64 if i == 0 else 128 for i in range(num_blocks)]
-        fast_channels = [8 if i == 0 else 16 for i in range(num_blocks)]
+        slow_channels = [128 if i == 0 else 128 for i in range(num_blocks)]
+        fast_channels = [16 if i == 0 else 16 for i in range(num_blocks)]
 
         # Slow pathway
         self.slow_blocks = nn.ModuleList([
@@ -126,7 +126,6 @@ class HemisphereStream(nn.Module):
             nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(1, 2, 2), padding=0),
             ResBlock(dim_in=slow_channels[6], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
             ResBlock(dim_in=slow_channels[7], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
-            ResBlock(dim_in=slow_channels[8], dim_out=128, temp_kernel_size=3, stride=1, dim_inner=16),
             nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(1, 2, 2), padding=0)
         ])
         # Fast pathway
@@ -142,7 +141,6 @@ class HemisphereStream(nn.Module):
             nn.MaxPool3d(kernel_size=(6, 2, 2), stride=(1, 2, 2), padding=0),
             ResBlock(dim_in=fast_channels[6], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
             ResBlock(dim_in=fast_channels[7], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
-            ResBlock(dim_in=fast_channels[8], dim_out=16, temp_kernel_size=3, stride=1, dim_inner=8),
             nn.MaxPool3d(kernel_size=(6, 2, 2), stride=(1, 2, 2), padding=0)
         ])
 
@@ -173,8 +171,46 @@ class DualStream(nn.Module):
         super(DualStream, self).__init__()
         self.left_hemisphere = HemisphereStream()
         self.right_hemisphere = HemisphereStream()
-        self.dpc_rnn = DPC_RNN(feature_size=288, hidden_size=288, kernel_size=1, num_layers=1, pred_steps=3, seq_len=3) # normally 5 for SL
-        # feature size is 144 * 2
+        self.dpc_rnn = DPC_RNN(feature_size=288, hidden_size=288, kernel_size=1, num_layers=1, pred_steps=3, seq_len=1) # normally 5 for SL
+
+        self.left_ff_layers = nn.Sequential(
+            nn.Linear(144, 72),
+            nn.ReLU(),
+            nn.Linear(72, 36),
+            nn.ReLU(),
+            nn.Linear(36, 1)
+        )
+        
+        self.right_ff_layers = nn.Sequential(
+            nn.Linear(144, 72),
+            nn.ReLU(),
+            nn.Linear(72, 36),
+            nn.ReLU(),
+            nn.Linear(36, 1)
+        )
+
+        self.left_predict_right_flat = None
+        self.right_predict_left_flat = None
+
+        self.dropout = nn.Dropout(p=universal_dropout)
+
+    def _create_predict_layer(self, input_dim, output_dim):
+        layer = nn.Sequential(
+            nn.Linear(input_dim, 144),
+            nn.ReLU(),
+            nn.Linear(144, 200),
+            nn.ReLU(),
+            nn.Linear(200, output_dim)
+        )
+        self._initialize_weights_kaiming(layer)
+        return layer
+
+    def _initialize_weights_kaiming(self, module):
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         B, N, SL, C, H, W = x.shape
@@ -186,9 +222,69 @@ class DualStream(nn.Module):
         left_output = self.left_hemisphere(left_input)
         right_output = self.right_hemisphere(right_input)
 
+        # Reshape left and right outputs, flattening all dimensions except the last one (feature dimension 144)
+        left_output_reshaped = left_output.view(-1, 144)
+        right_output_reshaped = right_output.view(-1, 144)
+
+        weighted_left_output = self.left_ff_layers(left_output_reshaped)
+        weighted_right_output = self.right_ff_layers(right_output_reshaped)
+
+        left_predict_right_flat = nn.Sequential(
+            nn.Linear(weighted_left_output.shape[0], 144),
+            nn.ReLU(),
+            nn.Linear(144, 200),
+            nn.ReLU(),
+            nn.Linear(200, left_output_reshaped.shape[0])
+        ).to('cuda')
+
+        right_predict_left_flat = nn.Sequential(
+            nn.Linear(weighted_right_output.shape[0], 144),
+            nn.ReLU(),
+            nn.Linear(144, 200),
+            nn.ReLU(),
+            nn.Linear(200, right_output_reshaped.shape[0])
+        ).to('cuda')
+
+        if self.left_predict_right_flat is None:
+            self.left_predict_right_flat = self._create_predict_layer(left_output_reshaped.shape[0], right_output_reshaped.shape[0]).to('cuda')
+        if self.right_predict_left_flat is None:
+            self.right_predict_left_flat = self._create_predict_layer(right_output_reshaped.shape[0], left_output_reshaped.shape[0]).to('cuda')
+
+
+        weighted_left_predict_right_flat = left_predict_right_flat(weighted_left_output.T).T
+        weighted_right_predict_left_flat = right_predict_left_flat(weighted_right_output.T).T
+
+        # Calculate cosine similarity between weighted left and right outputs
+        hemisphere_cosine_score= torch.nn.functional.cosine_similarity(weighted_left_output, weighted_right_output, dim=1)
+        # Normalize the hemisphere_cosine_score
+        hemisphere_cosine_score = (hemisphere_cosine_score - hemisphere_cosine_score.mean()) / hemisphere_cosine_score.std()
+        # Collapse the hemisphere_cosine_score to a single value by taking the mean
+        hemisphere_cosine_score = torch.abs(hemisphere_cosine_score).sum()
+
+        # Calculate cosine similarity for weighted_left_predict_right_flat with right_output_reshaped
+        left_predict_right_cosine_score = torch.nn.functional.cosine_similarity(weighted_left_predict_right_flat, right_output_reshaped, dim=1)
+        # Normalize the left_predict_right_cosine_score
+        left_predict_right_cosine_score = (left_predict_right_cosine_score - left_predict_right_cosine_score.mean()) / left_predict_right_cosine_score.std()
+        # Collapse the left_predict_right_cosine_score to a single value by taking the mean
+        left_predict_right_cosine_score = torch.abs(left_predict_right_cosine_score).sum()
+
+        # Calculate cosine similarity for weighted_right_predict_left_flat with left_output_reshaped
+        right_predict_left_cosine_score = torch.nn.functional.cosine_similarity(weighted_right_predict_left_flat, left_output_reshaped, dim=1)
+        # Normalize the right_predict_left_cosine_score
+        right_predict_left_cosine_score = (right_predict_left_cosine_score - right_predict_left_cosine_score.mean()) / right_predict_left_cosine_score.std()
+        # Collapse the right_predict_left_cosine_score to a single value by taking the mean
+        right_predict_left_cosine_score = torch.abs(right_predict_left_cosine_score).sum()
+
+        """print("Hemisphere Cosine Score:", hemisphere_cosine_score.item())
+        print("Left Predict Right Cosine Score:", left_predict_right_cosine_score.item())
+        print("Right Predict Left Cosine Score:", right_predict_left_cosine_score.item())"""
+
+        hemisphere_cosine_score = (hemisphere_cosine_score + right_predict_left_cosine_score + left_predict_right_cosine_score) * 0.01
+        hemisphere_cosine_score = torch.nan_to_num(hemisphere_cosine_score)
+
         # Concatenate left and right hemisphere outputs
         concat_layer = torch.cat((left_output, right_output), dim=1)
+        concat_layer = self.dropout(concat_layer)
 
-        # Dropout can be added here if needed
         prediction, target, future_context = self.dpc_rnn(concat_layer, B, N, 288, SL, H, W//2)
-        return prediction, target, concat_layer, future_context
+        return prediction, target, concat_layer, future_context, hemisphere_cosine_score.unsqueeze(0)
