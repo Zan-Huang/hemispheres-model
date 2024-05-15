@@ -254,7 +254,7 @@ class DualStream(nn.Module):
         left_predict_right_mse = F.mse_loss(weighted_left_predict_right_flat, right_output_reshaped, reduction='sum')
         right_predict_left_mse = F.mse_loss(weighted_right_predict_left_flat, left_output_reshaped, reduction='sum')
 
-        hemisphere_mse = 1e-6 * (hemisphere_mse + right_predict_left_mse + left_predict_right_mse)
+        hemisphere_mse = 1 * (hemisphere_mse + right_predict_left_mse + left_predict_right_mse)
         hemisphere_mse = torch.nan_to_num(hemisphere_mse)
 
         # Concatenate left and right hemisphere outputs
