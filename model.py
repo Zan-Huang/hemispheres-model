@@ -176,16 +176,20 @@ class DualStream(nn.Module):
         self.left_ff_layers = nn.Sequential(
             nn.Linear(144, 72),
             nn.ReLU(),
+            nn.Dropout(p=universal_dropout),
             nn.Linear(72, 36),
             nn.ReLU(),
+            nn.Dropout(p=universal_dropout),
             nn.Linear(36, 1)
         )
         
         self.right_ff_layers = nn.Sequential(
             nn.Linear(144, 72),
             nn.ReLU(),
+            nn.Dropout(p=universal_dropout),
             nn.Linear(72, 36),
             nn.ReLU(),
+            nn.Dropout(p=universal_dropout),
             nn.Linear(36, 1)
         )
 
@@ -229,62 +233,29 @@ class DualStream(nn.Module):
         weighted_left_output = self.left_ff_layers(left_output_reshaped)
         weighted_right_output = self.right_ff_layers(right_output_reshaped)
 
-        left_predict_right_flat = nn.Sequential(
-            nn.Linear(weighted_left_output.shape[0], 144),
-            nn.ReLU(),
-            nn.Linear(144, 200),
-            nn.ReLU(),
-            nn.Linear(200, left_output_reshaped.shape[0])
-        ).to('cuda')
-
-        right_predict_left_flat = nn.Sequential(
-            nn.Linear(weighted_right_output.shape[0], 144),
-            nn.ReLU(),
-            nn.Linear(144, 200),
-            nn.ReLU(),
-            nn.Linear(200, right_output_reshaped.shape[0])
-        ).to('cuda')
-
         if self.left_predict_right_flat is None:
             self.left_predict_right_flat = self._create_predict_layer(left_output_reshaped.shape[0], right_output_reshaped.shape[0]).to('cuda')
         if self.right_predict_left_flat is None:
             self.right_predict_left_flat = self._create_predict_layer(right_output_reshaped.shape[0], left_output_reshaped.shape[0]).to('cuda')
 
-
-        weighted_left_predict_right_flat = left_predict_right_flat(weighted_left_output.T).T
-        weighted_right_predict_left_flat = right_predict_left_flat(weighted_right_output.T).T
+        weighted_left_predict_right_flat = self.left_predict_right_flat(weighted_left_output.T).T
+        weighted_right_predict_left_flat = self.right_predict_left_flat(weighted_right_output.T).T
 
         # Calculate cosine similarity between weighted left and right outputs
-        hemisphere_cosine_score= torch.nn.functional.cosine_similarity(weighted_left_output, weighted_right_output, dim=1)
-        # Normalize the hemisphere_cosine_score
-        hemisphere_cosine_score = (hemisphere_cosine_score - hemisphere_cosine_score.mean()) / hemisphere_cosine_score.std()
-        # Collapse the hemisphere_cosine_score to a single value by taking the mean
-        hemisphere_cosine_score = torch.abs(hemisphere_cosine_score).sum()
-
-        # Calculate cosine similarity for weighted_left_predict_right_flat with right_output_reshaped
-        left_predict_right_cosine_score = torch.nn.functional.cosine_similarity(weighted_left_predict_right_flat, right_output_reshaped, dim=1)
-        # Normalize the left_predict_right_cosine_score
-        left_predict_right_cosine_score = (left_predict_right_cosine_score - left_predict_right_cosine_score.mean()) / left_predict_right_cosine_score.std()
-        # Collapse the left_predict_right_cosine_score to a single value by taking the mean
-        left_predict_right_cosine_score = torch.abs(left_predict_right_cosine_score).sum()
-
-        # Calculate cosine similarity for weighted_right_predict_left_flat with left_output_reshaped
-        right_predict_left_cosine_score = torch.nn.functional.cosine_similarity(weighted_right_predict_left_flat, left_output_reshaped, dim=1)
-        # Normalize the right_predict_left_cosine_score
-        right_predict_left_cosine_score = (right_predict_left_cosine_score - right_predict_left_cosine_score.mean()) / right_predict_left_cosine_score.std()
-        # Collapse the right_predict_left_cosine_score to a single value by taking the mean
-        right_predict_left_cosine_score = torch.abs(right_predict_left_cosine_score).sum()
+        hemisphere_mse = F.mse_loss(weighted_left_output, weighted_right_output, reduction='sum')
+        left_predict_right_mse = F.mse_loss(weighted_left_predict_right_flat, right_output_reshaped, reduction='sum')
+        right_predict_left_mse = F.mse_loss(weighted_right_predict_left_flat, left_output_reshaped, reduction='sum')
 
         """print("Hemisphere Cosine Score:", hemisphere_cosine_score.item())
         print("Left Predict Right Cosine Score:", left_predict_right_cosine_score.item())
         print("Right Predict Left Cosine Score:", right_predict_left_cosine_score.item())"""
 
-        hemisphere_cosine_score = (hemisphere_cosine_score + right_predict_left_cosine_score + left_predict_right_cosine_score) * 0.01
-        hemisphere_cosine_score = torch.nan_to_num(hemisphere_cosine_score)
+        hemisphere_mse = 1e-6 * (hemisphere_mse + right_predict_left_mse + left_predict_right_mse)
+        hemisphere_mse = torch.nan_to_num(hemisphere_mse)
 
         # Concatenate left and right hemisphere outputs
         concat_layer = torch.cat((left_output, right_output), dim=1)
         concat_layer = self.dropout(concat_layer)
 
         prediction, target, future_context = self.dpc_rnn(concat_layer, B, N, 288, SL, H, W//2)
-        return prediction, target, concat_layer, future_context, hemisphere_cosine_score.unsqueeze(0)
+        return prediction, target, concat_layer, future_context, hemisphere_mse.unsqueeze(0)
