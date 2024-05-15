@@ -202,11 +202,11 @@ class DualStream(nn.Module):
         layer = nn.Sequential(
             nn.Linear(input_dim, 144),
             nn.ReLU(),
-            nn.Linear(144, 200),
+            nn.Linear(144, 144),
             nn.ReLU(),
-            nn.Linear(200, 144),
+            nn.Linear(144, 144),
             nn.ReLU(),
-            nn.Linear(144, output_dim)
+            nn.Linear(144, output_dim*144)
         )
         self._initialize_weights_kaiming(layer)
         return layer
@@ -240,17 +240,19 @@ class DualStream(nn.Module):
         if self.right_predict_left_flat is None:
             self.right_predict_left_flat = self._create_predict_layer(right_output_reshaped.shape[0], left_output_reshaped.shape[0]).to('cuda')
 
-        weighted_left_predict_right_flat = self.left_predict_right_flat(weighted_left_output.T)
-        weighted_right_predict_left_flat = self.right_predict_left_flat(weighted_right_output.T)
+        weighted_left_predict_right_flat = self.left_predict_right_flat(weighted_left_output.T).reshape(-1, 144)
+        weighted_right_predict_left_flat = self.right_predict_left_flat(weighted_right_output.T).reshape(-1, 144)
+
+        #print("Shape of weighted_left_predict_right_flat:", weighted_left_predict_right_flat.shape)
+        #print("Shape of weighted_right_predict_left_flat:", weighted_right_predict_left_flat.shape)
+
+        #print("Shape of left_output_reshaped:", left_output_reshaped.shape)
+        #print("Shape of right_output_reshaped:", right_output_reshaped.shape)
 
         # Calculate cosine similarity between weighted left and right outputs
         hemisphere_mse = F.mse_loss(weighted_left_output, weighted_right_output, reduction='sum')
         left_predict_right_mse = F.mse_loss(weighted_left_predict_right_flat, right_output_reshaped, reduction='sum')
         right_predict_left_mse = F.mse_loss(weighted_right_predict_left_flat, left_output_reshaped, reduction='sum')
-
-        """print("Hemisphere Cosine Score:", hemisphere_cosine_score.item())
-        print("Left Predict Right Cosine Score:", left_predict_right_cosine_score.item())
-        print("Right Predict Left Cosine Score:", right_predict_left_cosine_score.item())"""
 
         hemisphere_mse = 1e-6 * (hemisphere_mse + right_predict_left_mse + left_predict_right_mse)
         hemisphere_mse = torch.nan_to_num(hemisphere_mse)
