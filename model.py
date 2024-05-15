@@ -204,7 +204,9 @@ class DualStream(nn.Module):
             nn.ReLU(),
             nn.Linear(144, 200),
             nn.ReLU(),
-            nn.Linear(200, output_dim)
+            nn.Linear(200, 144),
+            nn.ReLU(),
+            nn.Linear(144, output_dim)
         )
         self._initialize_weights_kaiming(layer)
         return layer
@@ -238,8 +240,8 @@ class DualStream(nn.Module):
         if self.right_predict_left_flat is None:
             self.right_predict_left_flat = self._create_predict_layer(right_output_reshaped.shape[0], left_output_reshaped.shape[0]).to('cuda')
 
-        weighted_left_predict_right_flat = self.left_predict_right_flat(weighted_left_output.T).T
-        weighted_right_predict_left_flat = self.right_predict_left_flat(weighted_right_output.T).T
+        weighted_left_predict_right_flat = self.left_predict_right_flat(weighted_left_output.T)
+        weighted_right_predict_left_flat = self.right_predict_left_flat(weighted_right_output.T)
 
         # Calculate cosine similarity between weighted left and right outputs
         hemisphere_mse = F.mse_loss(weighted_left_output, weighted_right_output, reduction='sum')
